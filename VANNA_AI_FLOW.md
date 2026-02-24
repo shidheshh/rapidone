@@ -2,7 +2,7 @@
 
 > This document explains how the AI query system works end-to-end.
 > Starts where AUTH_FLOW.md ends — FastAPI has received the enriched request from .NET with all user context.
-> Covers: database architecture, Vanna training, entity detection, permission enforcement, SQL generation, validation, execution, and response.
+> Covers: database architecture, shared Vanna training with XXX_ placeholder, entity detection, permission enforcement, SQL generation, prefix replacement, validation, execution, and response.
 
 ---
 
@@ -44,10 +44,12 @@ Every customer (prefix = `XXX`) has these databases on the **same SQL Server ins
 |---|---|---|---|
 | Main App DB | `XXX_RapidOne` | Leads, Appointments, Schedules, Branches, Departments, Users, Permissions | Always connected at startup |
 | SAP DB | `XXX_Rapid_Common` | Patients/Customers (OCRD table), Treatments, Treatment Plans | Always connected at startup |
-| Issuer DB(s) | `Issuer1`, `Issuer2`, ... `IssuerN` | Invoices, Receipts (financial documents) | Lazy — connected only when a permitted user queries financial data |
+| Issuer DB(s) | `XXX_Issuer1`, `XXX_Issuer2`, ... `XXX_IssuerN` | Invoices, Receipts (financial SAP databases) | Lazy — connected only when a permitted user queries financial data |
 
 Important notes:
-- Issuer DB names are the `Issuers.Id` value directly — NOT prefixed with `XXX_`. Example: `Issuer1`, not `Keshevrav_Issuer1`
+- **ALL databases are prefixed with the customer name** — including issuers
+- Example for Keshevrav customer: `Keshevrav_RapidOne`, `Keshevrav_Rapid_Common`, `Keshevrav_Issuer1`, `Keshevrav_Issuer2`
+- `Issuers.Id` in the database stores the issuer identifier (e.g., `Issuer1`). The full DB name is `{PREFIX}_{IssuerId}`
 - A customer can have **multiple Issuer databases** — one per financial entity
 - All databases exist on the **same SQL Server instance**, so cross-database JOINs work natively
 
@@ -60,7 +62,8 @@ Read config → DB_PREFIX = "Keshevrav", DB_SERVER = "156.67.105.206"
     → Build known names: Keshevrav_RapidOne, Keshevrav_Rapid_Common
     → Connect to both (ALWAYS connected)
     → Query Issuers table: SELECT Id FROM Keshevrav_RapidOne.dbo.Issuers
-    → Discover: Issuer1, Issuer2 (these ARE the database names)
+    → Discover: Issuer1, Issuer2 (issuer identifiers)
+    → Full DB names: Keshevrav_Issuer1, Keshevrav_Issuer2
     → Issuer connections are LAZY (created only when needed)
     → Connection Pool Ready
 ```
@@ -98,29 +101,52 @@ No special configuration needed. The SQL Server login used by FastAPI just needs
 |---|---|---|
 | Appointments + Patient details | `XXX_RapidOne` + `XXX_Rapid_Common` | Appointments JOIN OCRD ON PatientId = CardCode |
 | Leads + Patient details | `XXX_RapidOne` + `XXX_Rapid_Common` | Leads JOIN OCRD ON PatientID = CardCode |
-| Invoices + Branch details | `IssuerN` + `XXX_RapidOne` | Invoices JOIN Branches ON BranchId |
+| Invoices + Branch details | `XXX_IssuerN` + `XXX_RapidOne` | Invoices JOIN Branches ON BranchId |
 | Treatments + Patient details | `XXX_Rapid_Common` (same DB) | Treatments JOIN OCRD ON CardCode |
 
 ---
 
 ## Part 4: Vanna AI Training Strategy
 
-### 4.1 One Vanna Instance Per Customer
+### 4.1 ONE Shared Vanna For ALL Customers On A Server
 
-We use ONE Vanna instance per customer deployment. This single instance is trained with schemas from ALL databases (Main + SAP + all Issuers). Because all databases are on the same SQL Server, Vanna can generate cross-DB JOINs naturally.
+All customers on the same server share the **exact same database schema** — just with different data and different prefix. So instead of one Vanna per customer, we use **ONE shared Vanna** trained with `XXX_` placeholder prefix.
 
-### 4.2 Training Data — Three Types
+```
+Server A has 10 customers:
+    Keshevrav, ClinicB, ClinicC, ClinicD, ClinicE,
+    ClinicF, ClinicG, ClinicH, ClinicI, ClinicJ
 
-Vanna needs three types of training data for accurate SQL generation:
+Instead of:
+    ❌ 10 separate Vanna instances (10x memory, 10x training)
+
+We do:
+    ✅ 1 shared Vanna trained with XXX_ prefix
+    ✅ Each customer's FastAPI process uses the same trained Vanna
+    ✅ After SQL generation, replace XXX_ with actual customer prefix
+```
+
+### Why This Works
+
+| Concern | Answer |
+|---|---|
+| Same schema? | YES — all customers have identical table structures |
+| Latency? | BETTER — one vector store in RAM instead of 10. LLM API call is the same regardless |
+| Retrieval accuracy? | SAME — vector search matches on question semantics ("appointments", "today"), not on the prefix name |
+| Hallucination? | LOW — `XXX_` pattern is heavily reinforced across all training data. SQL validation catches edge cases |
+| Memory savings? | ~10x less RAM for embeddings (one vector store instead of 10) |
+| Training updates? | SIMPLER — update once, all customers benefit |
+
+### 4.2 Training Data — Three Types (All Using XXX_ Prefix)
+
+Vanna needs three types of training data for accurate SQL generation. **ALL training uses `XXX_` as the database prefix.**
 
 **Type 1: DDL (Table Definitions)**
-
-Train Vanna with fully-qualified DDL for every table the AI can access:
 
 ```python
 # Main App DB tables
 vn.train(ddl="""
-CREATE TABLE Keshevrav_RapidOne.dbo.Appointments (
+CREATE TABLE XXX_RapidOne.dbo.Appointments (
     AppointmentId INT PRIMARY KEY,
     Date DATETIME,
     DoctorId NVARCHAR(128),         -- FK to AspNetUsers.Id (doctor)
@@ -131,9 +157,22 @@ CREATE TABLE Keshevrav_RapidOne.dbo.Appointments (
 )
 """)
 
+vn.train(ddl="""
+CREATE TABLE XXX_RapidOne.dbo.Leads (
+    LeadId INT PRIMARY KEY,
+    FirstName NVARCHAR(100),
+    LastName NVARCHAR(100),
+    Phone NVARCHAR(20),
+    AssignedTo NVARCHAR(128),       -- FK to AspNetUsers.Id (assigned agent)
+    Branch INT,                     -- FK to Branches.BranchId (NOT DepartmentID)
+    StatusId INT,
+    IsDeleted BIT                   -- 0=active, 1=deleted
+)
+""")
+
 # SAP DB tables
 vn.train(ddl="""
-CREATE TABLE Keshevrav_Rapid_Common.dbo.OCRD (
+CREATE TABLE XXX_Rapid_Common.dbo.OCRD (
     CardCode NVARCHAR(15) PRIMARY KEY,   -- Patient ID
     CardName NVARCHAR(100),              -- Patient full name
     Phone1 NVARCHAR(20),
@@ -145,9 +184,9 @@ CREATE TABLE Keshevrav_Rapid_Common.dbo.OCRD (
 )
 """)
 
-# Issuer DB tables (same structure for all issuers)
+# Issuer DB tables (same structure for all issuers — also uses XXX_ prefix)
 vn.train(ddl="""
-CREATE TABLE {ISSUER_DB}.dbo.Invoices (
+CREATE TABLE XXX_Issuer1.dbo.Invoices (
     InvoiceId INT PRIMARY KEY,
     PatientId NVARCHAR(15),
     BranchId INT,
@@ -156,44 +195,62 @@ CREATE TABLE {ISSUER_DB}.dbo.Invoices (
     Status INT
 )
 """)
+
+vn.train(ddl="""
+CREATE TABLE XXX_Issuer1.dbo.Receipts (
+    ReceiptId INT PRIMARY KEY,
+    PatientId NVARCHAR(15),
+    Amount DECIMAL(18,2),
+    ReceiptDate DATETIME,
+    Status INT
+)
+""")
 ```
 
 **Type 2: Metadata (Column Descriptions + Business Context)**
 
-DDL alone is not enough. The AI needs to understand what columns mean in the medical CMS context:
-
 ```python
 vn.train(documentation="""
-Table: OCRD (in Keshevrav_Rapid_Common database)
+DATABASE STRUCTURE:
+- XXX_RapidOne = Main application database (leads, appointments, schedules, branches, departments, users)
+- XXX_Rapid_Common = SAP database (patients/customers in OCRD table, treatments, treatment plans)
+- XXX_Issuer1, XXX_Issuer2, etc. = Financial SAP databases (invoices, receipts)
+- All databases use the XXX_ prefix. XXX is a placeholder for the customer name.
+- All databases are on the same SQL Server instance, so cross-database JOINs work.
+
+Table: OCRD (in XXX_Rapid_Common)
 - This is the Patients/Customers table (SAP Business One naming convention)
 - CardCode = Patient ID (primary key, format: patient number as string)
 - CardName = Patient full name
 - U_Gender: 1 = Male, 2 = Female
-- This table is in the SAP database (Rapid_Common), NOT in the main RapidOne database
 - To get patient details for an appointment, JOIN Appointments.PatientId = OCRD.CardCode
 
-Table: Leads (in Keshevrav_RapidOne database)
+Table: Leads (in XXX_RapidOne)
 - Branch column = physical location (int FK to Branches.BranchId), NOT DepartmentID
 - AssignedTo = user ID of the assigned call center agent (nvarchar(128))
 - IsDeleted: 0 = active lead, 1 = deleted/archived
 - Always filter WHERE IsDeleted = 0 unless specifically asked for deleted leads
 
-Table: Appointments (in Keshevrav_RapidOne database)
+Table: Appointments (in XXX_RapidOne)
 - DoctorId = the doctor who owns this appointment (nvarchar(128), FK to AspNetUsers.Id)
 - There is NO 'ScheduleId' column in this table
 - To filter by schedule access, use: DoctorId IN (list of allowed doctor IDs)
 - DepartmentId = the specialty department where this appointment takes place
 
-Table: LinkUsersToSchedules (in Keshevrav_RapidOne database)
+Table: LinkUsersToSchedules (in XXX_RapidOne)
 - UserId = the user who is viewing (the logged-in user)
 - ScheduleId = the doctor whose schedule they can see (this IS a DoctorId from AspNetUsers.Id)
 - A "schedule" is not a separate entity — it is a doctor's schedule
+
+Table: Invoices (in XXX_Issuer1, XXX_Issuer2, etc.)
+- Each issuer database has the same table structure
+- InvoiceId = unique invoice identifier
+- PatientId = FK to OCRD.CardCode
+- BranchId = FK to Branches.BranchId
 """)
 ```
 
-**Type 3: Sample Question-SQL Pairs**
-
-These are the most important for accuracy. Train with real examples that demonstrate permission-aware queries:
+**Type 3: Sample Question-SQL Pairs (Most Important For Accuracy)**
 
 ```python
 # Appointments with patient details (cross-DB JOIN)
@@ -207,10 +264,10 @@ vn.train(
         c.CardName AS PatientName,
         c.Phone1,
         d.DepartmentName
-    FROM Keshevrav_RapidOne.dbo.Appointments a
-    JOIN Keshevrav_Rapid_Common.dbo.OCRD c ON a.PatientId = c.CardCode
-    JOIN Keshevrav_RapidOne.dbo.AspNetUsers u ON a.DoctorId = u.Id
-    JOIN Keshevrav_RapidOne.dbo.Departments d ON a.DepartmentId = d.DepartmentId
+    FROM XXX_RapidOne.dbo.Appointments a
+    JOIN XXX_Rapid_Common.dbo.OCRD c ON a.PatientId = c.CardCode
+    JOIN XXX_RapidOne.dbo.AspNetUsers u ON a.DoctorId = u.Id
+    JOIN XXX_RapidOne.dbo.Departments d ON a.DepartmentId = d.DepartmentId
     WHERE CAST(a.Date AS DATE) = CAST(GETDATE() AS DATE)
     """
 )
@@ -226,10 +283,24 @@ vn.train(
         l.Phone,
         l.StatusId,
         b.BranchName
-    FROM Keshevrav_RapidOne.dbo.Leads l
-    JOIN Keshevrav_RapidOne.dbo.Branches b ON l.Branch = b.BranchId
+    FROM XXX_RapidOne.dbo.Leads l
+    JOIN XXX_RapidOne.dbo.Branches b ON l.Branch = b.BranchId
     WHERE l.AssignedTo = @UserId
     AND l.IsDeleted = 0
+    """
+)
+
+# Invoices from issuer DB (cross-DB JOIN with main DB)
+vn.train(
+    question="show invoices with branch names",
+    sql="""
+    SELECT
+        i.InvoiceId,
+        i.Amount,
+        i.InvoiceDate,
+        b.BranchName
+    FROM XXX_Issuer1.dbo.Invoices i
+    JOIN XXX_RapidOne.dbo.Branches b ON i.BranchId = b.BranchId
     """
 )
 
@@ -241,14 +312,51 @@ vn.train(
         a.AppointmentId,
         a.Date,
         c.CardName AS PatientName
-    FROM Keshevrav_RapidOne.dbo.Appointments a
-    JOIN Keshevrav_Rapid_Common.dbo.OCRD c ON a.PatientId = c.CardCode
+    FROM XXX_RapidOne.dbo.Appointments a
+    JOIN XXX_Rapid_Common.dbo.OCRD c ON a.PatientId = c.CardCode
     WHERE CAST(a.Date AS DATE) = CAST(GETDATE() AS DATE)
     """
 )
 ```
 
-### 4.3 Hebrew Entity Mapping
+### 4.3 The XXX_ Replacement — How It Works At Runtime
+
+After Vanna generates SQL with `XXX_` prefix, we do a simple string replacement:
+
+```python
+DB_PREFIX = "Keshevrav"   # from .env config
+
+# Vanna generates:
+sql = "SELECT * FROM XXX_RapidOne.dbo.Leads WHERE IsDeleted = 0"
+
+# Replace XXX_ with actual customer prefix:
+sql = sql.replace("XXX_", f"{DB_PREFIX}_")
+
+# Result:
+sql = "SELECT * FROM Keshevrav_RapidOne.dbo.Leads WHERE IsDeleted = 0"
+```
+
+This ONE replacement handles ALL databases:
+
+```
+XXX_RapidOne       → Keshevrav_RapidOne
+XXX_Rapid_Common   → Keshevrav_Rapid_Common
+XXX_Issuer1        → Keshevrav_Issuer1
+XXX_Issuer2        → Keshevrav_Issuer2
+```
+
+**Why `XXX_` replacement is safe:**
+- `XXX_RapidOne`, `XXX_Rapid_Common`, `XXX_Issuer1` are very specific strings
+- They only appear as database names in fully-qualified table references
+- They won't appear inside column values, string literals, or WHERE conditions
+- After replacement, SQL validation checks all database names against the whitelist
+
+**Why not just replace `XXX` without the underscore?**
+- `XXX` could appear inside string values like `'XXXL size'` or column aliases
+- `XXX_` is more specific and only matches the database prefix pattern
+- Safe and deterministic
+
+### 4.4 Hebrew Entity Mapping
 
 The training and system prompt must include Hebrew-to-English entity mapping so the AI understands Hebrew questions:
 
@@ -257,8 +365,8 @@ Hebrew Term     →  English Entity    →  Table
 לידים            →  Leads             →  Leads (in XXX_RapidOne)
 תורים            →  Appointments      →  Appointments (in XXX_RapidOne)
 מטופלים          →  Patients          →  OCRD (in XXX_Rapid_Common)
-חשבוניות         →  Invoices          →  Invoices (in IssuerN)
-קבלות            →  Receipts          →  Receipts (in IssuerN)
+חשבוניות         →  Invoices          →  Invoices (in XXX_IssuerN)
+קבלות            →  Receipts          →  Receipts (in XXX_IssuerN)
 רופאים           →  Doctors           →  AspNetUsers (in XXX_RapidOne)
 טיפולים          →  Treatments        →  Treatments (in XXX_Rapid_Common)
 סניפים           →  Branches          →  Branches (in XXX_RapidOne)
@@ -270,9 +378,25 @@ Hebrew Term     →  English Entity    →  Table
 SQL is ALWAYS generated in English regardless of the question language.
 The response text should be in the same language as the question.
 
-### 4.4 Training is Done Once Per Schema Version
+### 4.5 Training Is Done ONCE — Shared Across All Customers
 
-Since all customers share the same database schema (just different data and prefix), training is done ONCE. The trained model works for every customer. Only the database prefix changes per deployment (handled by config, not retraining).
+```
+Training flow:
+    1. Train Vanna ONCE with XXX_ prefix DDL + metadata + sample pairs
+    2. Store trained embeddings in vector database (ChromaDB/Qdrant)
+    3. All customer processes on the server point to the SAME vector store
+    4. Each process replaces XXX_ with its own DB_PREFIX after SQL generation
+
+What's SHARED (one copy for all customers):
+    - Vanna training data (DDL, metadata, sample pairs)
+    - Vector store (embeddings)
+
+What's UNIQUE per request:
+    - System prompt (user context, permissions, mandatory filters)
+    - Available issuer DB names (per user's Layer 5 permissions)
+    - XXX_ → actual prefix replacement (per customer config)
+    - Conversation memory (per user session)
+```
 
 ---
 
@@ -305,6 +429,13 @@ database        = body.database                → "Keshevrav_RapidOne"
 language        = body.language               → "he-IL"
 ```
 
+Extract the customer prefix from the database name:
+
+```python
+# body.database = "Keshevrav_RapidOne"
+DB_PREFIX = body.database.replace("_RapidOne", "")   # → "Keshevrav"
+```
+
 Load remaining layers from the customer database:
 
 ```sql
@@ -317,16 +448,18 @@ WHERE UserId = 'user-guid-123'
 SELECT IssuerId FROM Keshevrav_RapidOne.dbo.LinkIssuersToUsers
 WHERE UserId = 'user-guid-123'
 → Result: ["Issuer1", "Issuer2"]
+→ Full DB names: ["Keshevrav_Issuer1", "Keshevrav_Issuer2"]  (prefix + IssuerId)
 ```
 
 Now we have ALL 5 permission layers:
 
 ```
-Layer 1 (Roles):              ["DoctorWithCalendar"]           ← from .NET
-Layer 2 (UserPermissions):    ["Schedule - Open the..."]       ← from .NET (combined)
-Layer 3 (ProfilePermissions): (merged into Layer 2 above)      ← from .NET (combined)
+Layer 1 (Roles):              ["DoctorWithCalendar"]              ← from .NET
+Layer 2 (UserPermissions):    ["Schedule - Open the..."]          ← from .NET (combined)
+Layer 3 (ProfilePermissions): (merged into Layer 2 above)         ← from .NET (combined)
 Layer 4 (ScheduleAccess):     ["doctor-guid-1", "doctor-guid-2"] ← from DB
-Layer 5 (IssuerAccess):       ["Issuer1", "Issuer2"]            ← from DB
+Layer 5 (IssuerAccess):       ["Issuer1", "Issuer2"]             ← from DB
+    → Full DB names:          ["Keshevrav_Issuer1", "Keshevrav_Issuer2"]
 ```
 
 ### Step 3 — Detect Entity Type
@@ -402,15 +535,17 @@ Check permissions (Layer 2+3):
 
 For allowed entities, build a restricted DDL that ONLY contains tables and databases this user can access. This is the PRE-HOC approach — the AI can only see what the user is allowed to see.
 
+The schema uses `XXX_` prefix (same as training), because Vanna was trained with `XXX_`. We replace at Step 7b.
+
 Example for a DoctorWithCalendar user who has schedule permission + 2 linked schedules + 2 issuers:
 
 ```
-Allowed databases for this user:
-    ✅ Keshevrav_RapidOne       (always — main DB)
-    ✅ Keshevrav_Rapid_Common   (always — patient data)
-    ✅ Issuer1                  (from Layer 5)
-    ✅ Issuer2                  (from Layer 5)
-    ❌ Issuer3                  (user has no access — NOT included)
+Allowed databases for this user (XXX_ form for Vanna):
+    ✅ XXX_RapidOne              (always — main DB)
+    ✅ XXX_Rapid_Common          (always — patient data)
+    ✅ XXX_Issuer1               (from Layer 5)
+    ✅ XXX_Issuer2               (from Layer 5)
+    ❌ XXX_Issuer3               (user has no access — NOT included)
 
 Allowed tables:
     ✅ Appointments (with mandatory filter: DoctorId IN ('doctor-guid-1', 'doctor-guid-2'))
@@ -444,21 +579,22 @@ CURRENT USER:
 - Branch: ID 2
 - Language: Hebrew (he-IL)
 
-AVAILABLE DATABASES:
-- Keshevrav_RapidOne (main app — appointments, branches, departments)
-- Keshevrav_Rapid_Common (SAP — patients OCRD table, treatments)
-- Issuer1 (financial — invoices, receipts)
-- Issuer2 (financial — invoices, receipts)
+AVAILABLE DATABASES (use XXX_ prefix in all table references):
+- XXX_RapidOne (main app — appointments, branches, departments)
+- XXX_Rapid_Common (SAP — patients OCRD table, treatments)
+- XXX_Issuer1 (financial — invoices, receipts)
+- XXX_Issuer2 (financial — invoices, receipts)
 
 MANDATORY RULES — YOU MUST FOLLOW THESE:
-1. ALL table references MUST use fully-qualified names: DatabaseName.dbo.TableName
+1. ALL table references MUST use fully-qualified names: XXX_DatabaseName.dbo.TableName
 2. Appointment queries MUST include: WHERE DoctorId IN ('doctor-guid-1', 'doctor-guid-2')
-3. Invoice/Receipt queries MUST only reference Issuer1 or Issuer2 (no other issuer databases)
+3. Invoice/Receipt queries MUST only reference XXX_Issuer1 or XXX_Issuer2 (no other issuer databases)
 4. ONLY generate SELECT statements. Never INSERT, UPDATE, DELETE, DROP, or any DDL.
 5. If the user asks about Leads — respond that they don't have access to lead data.
+6. Always use the XXX_ prefix for database names.
 
 SCHEMA:
-[User-specific DDL from Step 5 — only allowed tables]
+[User-specific DDL from Step 5 — only allowed tables, all with XXX_ prefix]
 
 HEBREW ENTITY MAPPING:
 תורים = Appointments, מטופלים = Patients (OCRD table), חשבוניות = Invoices, רופאים = Doctors (AspNetUsers)
@@ -468,9 +604,9 @@ RESPONSE LANGUAGE:
 - Explanation text should be in Hebrew (user's language is he-IL)
 ```
 
-### Step 7 — Vanna Generates SQL
+### Step 7a — Vanna Generates SQL (With XXX_ Prefix)
 
-With the restricted schema and security rules baked into the system prompt, Vanna generates SQL:
+With the restricted schema and security rules baked into the system prompt, Vanna generates SQL using `XXX_` prefix:
 
 ```
 User question: "show me today's appointments"
@@ -483,19 +619,41 @@ Vanna generates:
         c.CardName AS PatientName,
         c.Phone1,
         d.DepartmentName
-    FROM Keshevrav_RapidOne.dbo.Appointments a
-    JOIN Keshevrav_Rapid_Common.dbo.OCRD c ON a.PatientId = c.CardCode
-    JOIN Keshevrav_RapidOne.dbo.AspNetUsers u ON a.DoctorId = u.Id
-    JOIN Keshevrav_RapidOne.dbo.Departments d ON a.DepartmentId = d.DepartmentId
+    FROM XXX_RapidOne.dbo.Appointments a
+    JOIN XXX_Rapid_Common.dbo.OCRD c ON a.PatientId = c.CardCode
+    JOIN XXX_RapidOne.dbo.AspNetUsers u ON a.DoctorId = u.Id
+    JOIN XXX_RapidOne.dbo.Departments d ON a.DepartmentId = d.DepartmentId
     WHERE CAST(a.Date AS DATE) = CAST(GETDATE() AS DATE)
     AND a.DoctorId IN ('doctor-guid-1', 'doctor-guid-2')
 ```
 
-Notice: The mandatory filter `DoctorId IN (...)` is included because the system prompt instructed the LLM to always include it. This is PRE-HOC — the security is in the prompt, not injected after.
+The mandatory filter `DoctorId IN (...)` is included because the system prompt instructed the LLM to always include it. This is PRE-HOC — the security is in the prompt, not injected after.
+
+### Step 7b — Replace XXX_ With Actual Customer Prefix
+
+```python
+DB_PREFIX = "Keshevrav"   # from config
+
+sql = sql.replace("XXX_", f"{DB_PREFIX}_")
+```
+
+Before replacement:
+```sql
+FROM XXX_RapidOne.dbo.Appointments a
+JOIN XXX_Rapid_Common.dbo.OCRD c ON ...
+```
+
+After replacement:
+```sql
+FROM Keshevrav_RapidOne.dbo.Appointments a
+JOIN Keshevrav_Rapid_Common.dbo.OCRD c ON ...
+```
+
+All databases replaced in one line. Simple, deterministic, safe.
 
 ### Step 8 — SQL Validation (5 Security Checks)
 
-Before executing, validate the generated SQL. Even though the prompt restricts the LLM, we validate as a safety net:
+After prefix replacement, validate the final SQL. Even though the prompt restricts the LLM, we validate as a safety net:
 
 ```
 Check 1: Is it SELECT only?
@@ -508,7 +666,7 @@ Check 2: No dangerous keywords?
 
 Check 3: All referenced databases in allowed list?
     → Parse SQL → extract database names
-    → Check against: ["Keshevrav_RapidOne", "Keshevrav_Rapid_Common", "Issuer1", "Issuer2"]
+    → Check against: ["Keshevrav_RapidOne", "Keshevrav_Rapid_Common", "Keshevrav_Issuer1", "Keshevrav_Issuer2"]
     → If any database not in list → BLOCKED
 
 Check 4: All referenced tables in allowed list?
@@ -519,7 +677,7 @@ Check 4: All referenced tables in allowed list?
 Check 5: Mandatory row-level filters present?
     → For Appointments: check DoctorId IN (...) is in WHERE clause
     → For Leads (if somehow generated): check AssignedTo = @UserId
-    → For Invoices: check database is in allowed issuers
+    → For Invoices: check database is in user's allowed issuers
     → If mandatory filter missing → BLOCKED
 
 All 5 pass → proceed to execution
@@ -529,16 +687,19 @@ Any fail → return error ("Query blocked: security validation failed")
 ### Step 9 — Execute SQL
 
 ```python
-# Build allowed database list for this user
+# Build allowed database list for this user (with actual prefix)
 allowed_dbs = [
-    "Keshevrav_RapidOne",           # always
-    "Keshevrav_Rapid_Common",       # always
-] + allowed_issuers                  # from Layer 5: ["Issuer1", "Issuer2"]
+    f"{DB_PREFIX}_RapidOne",             # "Keshevrav_RapidOne"
+    f"{DB_PREFIX}_Rapid_Common",         # "Keshevrav_Rapid_Common"
+]
+# Add user's permitted issuers with prefix
+for issuer_id in user_allowed_issuers:   # ["Issuer1", "Issuer2"]
+    allowed_dbs.append(f"{DB_PREFIX}_{issuer_id}")   # "Keshevrav_Issuer1", "Keshevrav_Issuer2"
 
 # Execute with timeout and row limit
-connection = get_connection(database="Keshevrav_RapidOne")  # primary connection
-result = connection.execute(validated_sql, timeout=30)       # 30-second timeout
-rows = result.fetchmany(1000)                                # max 1000 rows
+connection = get_connection(database=f"{DB_PREFIX}_RapidOne")  # primary connection
+result = connection.execute(validated_sql, timeout=30)          # 30-second timeout
+rows = result.fetchmany(1000)                                   # max 1000 rows
 columns = [desc[0] for desc in result.description]
 ```
 
@@ -566,34 +727,49 @@ This JSON goes back to .NET, which forwards it to Angular, which displays it in 
 
 ## Part 6: Multi-Issuer Query Handling
 
-A user may have access to multiple issuer databases. Here's how different scenarios are handled:
+A user may have access to multiple issuer databases. All issuer DBs follow the `XXX_IssuerN` naming pattern.
 
 ### Scenario 1: User asks about one specific issuer
 
 ```
 Question: "show invoices from Issuer1"
-→ Generate SQL using only Issuer1.dbo.Invoices
-→ Validate Issuer1 is in user's allowed list
-→ Execute
+
+Vanna generates (with XXX_ prefix):
+    SELECT * FROM XXX_Issuer1.dbo.Invoices WHERE ...
+
+After replacement:
+    SELECT * FROM Keshevrav_Issuer1.dbo.Invoices WHERE ...
+
+Validate Keshevrav_Issuer1 is in user's allowed list → YES → Execute
 ```
 
 ### Scenario 2: User asks "show all invoices" (multiple issuers)
 
 ```
 User has access to: ["Issuer1", "Issuer2"]
+System prompt says: "Available issuer databases: XXX_Issuer1, XXX_Issuer2"
 
-→ Generate SQL using UNION across all permitted issuers:
+Vanna generates:
+    SELECT InvoiceId, Amount, InvoiceDate, 'Issuer1' AS Source
+    FROM XXX_Issuer1.dbo.Invoices
+    WHERE InvoiceDate >= '2026-02-01'
+    UNION ALL
+    SELECT InvoiceId, Amount, InvoiceDate, 'Issuer2' AS Source
+    FROM XXX_Issuer2.dbo.Invoices
+    WHERE InvoiceDate >= '2026-02-01'
 
-SELECT InvoiceId, Amount, InvoiceDate, 'Issuer1' AS Source
-FROM Issuer1.dbo.Invoices
-WHERE InvoiceDate >= '2026-02-01'
-UNION ALL
-SELECT InvoiceId, Amount, InvoiceDate, 'Issuer2' AS Source
-FROM Issuer2.dbo.Invoices
-WHERE InvoiceDate >= '2026-02-01'
+After replacement (XXX_ → Keshevrav_):
+    SELECT InvoiceId, Amount, InvoiceDate, 'Issuer1' AS Source
+    FROM Keshevrav_Issuer1.dbo.Invoices
+    WHERE InvoiceDate >= '2026-02-01'
+    UNION ALL
+    SELECT InvoiceId, Amount, InvoiceDate, 'Issuer2' AS Source
+    FROM Keshevrav_Issuer2.dbo.Invoices
+    WHERE InvoiceDate >= '2026-02-01'
+
+Note: 'Issuer1' inside the string literal is NOT affected by replacement
+because we replace "XXX_" not "Issuer1"
 ```
-
-The system prompt tells the LLM which issuer databases are available and how to UNION them.
 
 ### Scenario 3: User has no issuer access
 
@@ -608,13 +784,19 @@ Layer 5 returns empty list → []
 
 ```
 Question: "show invoices with branch names"
-→
-SELECT i.InvoiceId, i.Amount, b.BranchName
-FROM Issuer1.dbo.Invoices i
-JOIN Keshevrav_RapidOne.dbo.Branches b ON i.BranchId = b.BranchId
-```
 
-This works because all databases are on the same SQL Server instance.
+Vanna generates:
+    SELECT i.InvoiceId, i.Amount, b.BranchName
+    FROM XXX_Issuer1.dbo.Invoices i
+    JOIN XXX_RapidOne.dbo.Branches b ON i.BranchId = b.BranchId
+
+After replacement:
+    SELECT i.InvoiceId, i.Amount, b.BranchName
+    FROM Keshevrav_Issuer1.dbo.Invoices i
+    JOIN Keshevrav_RapidOne.dbo.Branches b ON i.BranchId = b.BranchId
+
+Works because all databases are on the same SQL Server instance.
+```
 
 ---
 
@@ -640,7 +822,7 @@ These are **combined** by .NET's getUserInfo() into one array. Examples:
 ### Layer 4: Schedule Access (from DB → `LinkUsersToSchedules`)
 
 ```sql
-SELECT ScheduleId FROM LinkUsersToSchedules WHERE UserId = @user_id
+SELECT ScheduleId FROM XXX_RapidOne.dbo.LinkUsersToSchedules WHERE UserId = @user_id
 ```
 
 - ScheduleId = DoctorId (a doctor's "schedule" IS their user ID)
@@ -650,10 +832,11 @@ SELECT ScheduleId FROM LinkUsersToSchedules WHERE UserId = @user_id
 ### Layer 5: Issuer Access (from DB → `LinkIssuersToUsers`)
 
 ```sql
-SELECT IssuerId FROM LinkIssuersToUsers WHERE UserId = @user_id
+SELECT IssuerId FROM XXX_RapidOne.dbo.LinkIssuersToUsers WHERE UserId = @user_id
 ```
 
-- IssuerId IS the database name directly (e.g., "Issuer1" = database named "Issuer1")
+- IssuerId is the issuer identifier (e.g., `Issuer1`)
+- Full database name = `{DB_PREFIX}_{IssuerId}` (e.g., `Keshevrav_Issuer1`)
 - Used to determine which financial databases the user can query
 - If empty → no invoice/receipt data visible
 
@@ -661,17 +844,21 @@ SELECT IssuerId FROM LinkIssuersToUsers WHERE UserId = @user_id
 
 ## Part 8: Database Whitelist — What Can Be Queried
 
-For every request, build a whitelist of allowed databases:
+For every request, build a whitelist of allowed databases (with actual customer prefix):
 
 ```python
+DB_PREFIX = "Keshevrav"
+
 # Always allowed
 allowed_dbs = [
-    f"{DB_PREFIX}_RapidOne",        # e.g., "Keshevrav_RapidOne"
-    f"{DB_PREFIX}_Rapid_Common",    # e.g., "Keshevrav_Rapid_Common"
+    f"{DB_PREFIX}_RapidOne",        # "Keshevrav_RapidOne"
+    f"{DB_PREFIX}_Rapid_Common",    # "Keshevrav_Rapid_Common"
 ]
 
-# Add user's permitted issuers (from Layer 5)
-allowed_dbs += user_allowed_issuers   # e.g., ["Issuer1", "Issuer2"]
+# Add user's permitted issuers with prefix
+for issuer_id in user_allowed_issuers:
+    allowed_dbs.append(f"{DB_PREFIX}_{issuer_id}")
+# → adds "Keshevrav_Issuer1", "Keshevrav_Issuer2"
 
 # Always blocked (system databases)
 blocked_dbs = ["master", "tempdb", "model", "msdb"]
@@ -692,7 +879,8 @@ Every step in the pipeline can fail. Here's what happens at each point:
 | Step 3 (Entity Detection) | Cannot determine entity | "I couldn't understand your question. Please try rephrasing." |
 | Step 4 (Permission Check) | User has no permission | "You don't have access to [entity] data. Contact your admin." |
 | Step 5 (Schema Building) | No allowed tables | "You don't have any data access configured. Contact your admin." |
-| Step 7 (SQL Generation) | Vanna/OpenAI fails | "Failed to generate query. Please try again." |
+| Step 7a (SQL Generation) | Vanna/OpenAI fails | "Failed to generate query. Please try again." |
+| Step 7b (Prefix Replace) | XXX_ still in SQL after replace | "Internal error. Please try again." (should never happen) |
 | Step 8 (SQL Validation) | Security check fails | "Query blocked for security reasons. Please rephrase your question." |
 | Step 9 (SQL Execution) | Database timeout | "Query took too long. Try a more specific question." |
 | Step 9 (SQL Execution) | SQL error | "Query failed. Please try a different question." |
@@ -710,6 +898,7 @@ FastAPI Server (port 8001 per customer)
 │
 ├── UserContextBuilder
 │       Builds complete user context from .NET enriched request
+│       Extracts DB_PREFIX from body.database
 │       Loads Layer 4 (LinkUsersToSchedules) from DB
 │       Loads Layer 5 (LinkIssuersToUsers) from DB
 │
@@ -724,27 +913,33 @@ FastAPI Server (port 8001 per customer)
 │
 ├── SchemaBuilder
 │       Builds user-specific DDL — only permitted tables and databases
-│       Includes fully-qualified table names
+│       Uses XXX_ prefix (matching Vanna training)
 │
 ├── SystemPromptBuilder
 │       Constructs the LLM system prompt with:
 │       - User context (name, role, department)
-│       - Restricted schema DDL
+│       - Restricted schema DDL (XXX_ prefix)
 │       - Mandatory row filters
 │       - Security rules
 │       - Hebrew entity mapping
-│       - Available databases
+│       - Available databases (XXX_ prefix)
 │
 ├── VannaManager
-│       Manages the Vanna 2.0 Agent instance
-│       Sends question to Vanna with system prompt
-│       Receives generated SQL
+│       Manages the SHARED Vanna instance (one per server, not per customer)
+│       Points to shared vector store (trained with XXX_ prefix)
+│       Sends question to Vanna with user-specific system prompt
+│       Receives generated SQL (with XXX_ prefix)
+│
+├── PrefixReplacer
+│       Replaces XXX_ with actual customer prefix (DB_PREFIX)
+│       sql.replace("XXX_", f"{DB_PREFIX}_")
+│       Validates no XXX_ remains after replacement
 │
 ├── SQLValidator
-│       5 security checks:
+│       5 security checks (runs AFTER prefix replacement):
 │       1. SELECT-only
 │       2. No dangerous keywords
-│       3. Allowed databases only
+│       3. Allowed databases only (actual names, not XXX_)
 │       4. Allowed tables only
 │       5. Mandatory row filters present
 │
@@ -772,9 +967,12 @@ AI_API_KEY=the-shared-secret-from-web-config  # must match .NET's web.config
 
 # Database
 DB_SERVER=156.67.105.206                      # SQL Server IP
-DB_PREFIX=Keshevrav                           # customer prefix
+DB_PREFIX=Keshevrav                           # customer prefix (used for XXX_ replacement)
 DB_USERNAME=sa                                # SQL login
 DB_PASSWORD=xxxxx                             # SQL password
+
+# Vanna (shared across all customers on this server)
+VANNA_STORE_PATH=/path/to/shared/vanna/store  # shared vector store location
 
 # OpenAI
 OPENAI_API_KEY=sk-xxxxx                       # for Vanna's LLM
@@ -785,22 +983,47 @@ QUERY_TIMEOUT=30                              # seconds
 MAX_ROWS=1000                                 # max rows returned
 ```
 
-Same code. Same trained model. Only config changes per customer.
+Same code. Same trained Vanna. Only config changes per customer.
+
+### Server-Level Shared Resources
+
+```
+Server A (156.67.105.206):
+│
+├── Shared Vanna Training Store (ONE copy)
+│       Trained with XXX_ prefix
+│       Used by ALL customer processes on this server
+│
+├── Customer: Keshevrav (port 8001, DB_PREFIX=Keshevrav)
+│       XXX_ → Keshevrav_ replacement
+│       Databases: Keshevrav_RapidOne, Keshevrav_Rapid_Common, Keshevrav_Issuer1
+│
+├── Customer: ClinicB (port 8002, DB_PREFIX=ClinicB)
+│       XXX_ → ClinicB_ replacement
+│       Databases: ClinicB_RapidOne, ClinicB_Rapid_Common, ClinicB_Issuer1, ClinicB_Issuer2
+│
+├── Customer: ClinicC (port 8003, DB_PREFIX=ClinicC)
+│       XXX_ → ClinicC_ replacement
+│       Databases: ClinicC_RapidOne, ClinicC_Rapid_Common, ClinicC_Issuer1
+│
+└── ... (up to N customers)
+```
 
 ---
 
 ## Part 12: What Each Person Needs To Do
 
 ### Us (Backend — FastAPI + Vanna):
-1. Build FastAPI server with all components from Part 10
-2. Train Vanna with DDL + metadata + sample pairs (Part 4)
-3. Implement entity detection (Part 5, Step 3)
-4. Implement 5-layer permission checking (Part 5, Step 4)
-5. Implement user-specific schema building (Part 5, Step 5)
-6. Implement system prompt builder with Hebrew mapping (Part 5, Step 6)
-7. Implement SQL validation — 5 security checks (Part 5, Step 8)
-8. Implement database connection management with lazy issuer connections
-9. Implement response formatting
+1. Train Vanna ONCE with XXX_ prefix DDL + metadata + sample pairs (Part 4)
+2. Build FastAPI server with all components from Part 10
+3. Implement XXX_ → DB_PREFIX replacement after SQL generation (Part 4.3)
+4. Implement entity detection (Part 5, Step 3)
+5. Implement 5-layer permission checking (Part 5, Step 4)
+6. Implement user-specific schema building with XXX_ prefix (Part 5, Step 5)
+7. Implement system prompt builder with Hebrew mapping (Part 5, Step 6)
+8. Implement SQL validation — 5 security checks (Part 5, Step 8)
+9. Implement database connection management with lazy issuer connections
+10. Implement response formatting
 
 ### Client .NET Team:
 1. Create `POST /api/ai/chat` endpoint (covered in AUTH_FLOW.md)
@@ -825,6 +1048,7 @@ Same code. Same trained model. Only config changes per customer.
 | Entity Detection + Permission Check | Blocks access to unauthorized entities BEFORE SQL generation | FastAPI |
 | User-Specific Schema (PRE-HOC) | LLM only sees allowed tables/databases | FastAPI → Vanna |
 | Mandatory Row Filters in Prompt (PRE-HOC) | LLM generates SQL with security filters built in | FastAPI → Vanna |
+| XXX_ Prefix Training | Generated SQL uses placeholder, not real DB names. Real names only appear after replacement | Vanna → FastAPI |
 | SQL Validation (5 checks) | Safety net — catches anything the LLM might generate wrong | FastAPI |
 | Database Whitelist | Blocks queries to unauthorized databases | FastAPI |
 | Query Timeout + Row Limit | Prevents resource abuse | FastAPI |
@@ -852,7 +1076,8 @@ Problems with POST-HOC:
 1. Build restricted schema — only include tables the user can access
 2. Add mandatory filters as RULES in the system prompt
 3. LLM generates SQL that is already filtered and restricted
-4. SQL validation is just a safety net, not the primary security
+4. Replace XXX_ with actual customer prefix
+5. SQL validation is just a safety net, not the primary security
 ```
 
 Benefits of PRE-HOC:
@@ -870,6 +1095,7 @@ Benefits of PRE-HOC:
 
 ```
 User: Dr. Cohen (DoctorWithCalendar role)
+Customer: Keshevrav (DB_PREFIX = "Keshevrav")
 Question: "show me today's appointments"
 
 Step 3 → Entity: APPOINTMENTS
@@ -877,12 +1103,20 @@ Step 4 → Has "Schedule - Open the schedule"? YES
          Has linked schedules? YES → ["doctor-guid-1", "doctor-guid-2"]
          → ALLOWED
 
-Step 5 → Schema includes: Appointments, OCRD, Departments, Branches, AspNetUsers
+Step 5 → Schema includes: Appointments, OCRD, Departments, Branches, AspNetUsers (all with XXX_ prefix)
          Schema excludes: Leads (no CC role), Invoices (not requested)
 
 Step 6 → Prompt includes: "Appointment queries MUST include: WHERE DoctorId IN ('doctor-guid-1', 'doctor-guid-2')"
 
-Step 7 → Vanna generates:
+Step 7a → Vanna generates (with XXX_ prefix):
+    SELECT a.Date, c.CardName AS PatientName, d.DepartmentName
+    FROM XXX_RapidOne.dbo.Appointments a
+    JOIN XXX_Rapid_Common.dbo.OCRD c ON a.PatientId = c.CardCode
+    JOIN XXX_RapidOne.dbo.Departments d ON a.DepartmentId = d.DepartmentId
+    WHERE CAST(a.Date AS DATE) = CAST(GETDATE() AS DATE)
+    AND a.DoctorId IN ('doctor-guid-1', 'doctor-guid-2')
+
+Step 7b → Replace XXX_ → Keshevrav_:
     SELECT a.Date, c.CardName AS PatientName, d.DepartmentName
     FROM Keshevrav_RapidOne.dbo.Appointments a
     JOIN Keshevrav_Rapid_Common.dbo.OCRD c ON a.PatientId = c.CardCode
@@ -895,25 +1129,33 @@ Step 9 → Execute → 5 rows returned
 Step 10 → Return JSON with columns + rows
 ```
 
-### Scenario B: Call center agent asks about leads
+### Scenario B: Call center agent asks about leads (Hebrew)
 
 ```
 User: Sarah (CallCenterAgent role)
+Customer: ClinicB (DB_PREFIX = "ClinicB")
 Question: "הראה לי את הלידים שלי" (Show me my leads)
 
 Step 3 → Language: Hebrew → Entity: LEADS (הלידים = Leads, שלי = my)
 Step 4 → Has CallCenterAgent role? YES
          → ALLOWED (filter: WHERE AssignedTo = 'sarah-guid' AND IsDeleted = 0)
 
-Step 5 → Schema includes: Leads, Branches
+Step 5 → Schema includes: Leads, Branches (with XXX_ prefix)
          Schema excludes: Appointments (no schedule permission), Invoices
 
 Step 6 → Prompt includes: "Lead queries MUST include: WHERE AssignedTo = 'sarah-guid' AND IsDeleted = 0"
 
-Step 7 → Vanna generates:
+Step 7a → Vanna generates:
     SELECT l.LeadId, l.FirstName, l.LastName, l.Phone, b.BranchName
-    FROM Keshevrav_RapidOne.dbo.Leads l
-    JOIN Keshevrav_RapidOne.dbo.Branches b ON l.Branch = b.BranchId
+    FROM XXX_RapidOne.dbo.Leads l
+    JOIN XXX_RapidOne.dbo.Branches b ON l.Branch = b.BranchId
+    WHERE l.AssignedTo = 'sarah-guid'
+    AND l.IsDeleted = 0
+
+Step 7b → Replace XXX_ → ClinicB_:
+    SELECT l.LeadId, l.FirstName, l.LastName, l.Phone, b.BranchName
+    FROM ClinicB_RapidOne.dbo.Leads l
+    JOIN ClinicB_RapidOne.dbo.Branches b ON l.Branch = b.BranchId
     WHERE l.AssignedTo = 'sarah-guid'
     AND l.IsDeleted = 0
 
@@ -926,6 +1168,7 @@ Step 10 → Return JSON (response text in Hebrew since question was Hebrew)
 
 ```
 User: Rachel (Receptionist role, no CC role)
+Customer: Keshevrav
 Question: "show me all leads"
 
 Step 3 → Entity: LEADS
@@ -934,31 +1177,44 @@ Step 4 → Has CallCenterAgent role? NO
          → BLOCKED
 
 Response: "You don't have access to lead data. Lead access requires a Call Center role."
-No SQL generated. No database query executed.
+No SQL generated. No database query executed. No Vanna call.
 ```
 
 ### Scenario D: User asks about invoices across multiple issuers
 
 ```
 User: Finance Manager (has issuers: Issuer1, Issuer2, Issuer3)
+Customer: Keshevrav (DB_PREFIX = "Keshevrav")
 Question: "show total invoices this month by issuer"
 
 Step 3 → Entity: INVOICES
 Step 4 → Has linked issuers? YES → ["Issuer1", "Issuer2", "Issuer3"]
          → ALLOWED
 
-Step 5 → Schema includes: Invoices from Issuer1, Issuer2, Issuer3
-Step 6 → Prompt includes: "Available issuer databases: Issuer1, Issuer2, Issuer3"
+Step 5 → Schema includes: Invoices from XXX_Issuer1, XXX_Issuer2, XXX_Issuer3
+Step 6 → Prompt includes: "Available issuer databases: XXX_Issuer1, XXX_Issuer2, XXX_Issuer3"
 
-Step 7 → Vanna generates:
+Step 7a → Vanna generates:
     SELECT 'Issuer1' AS IssuerName, COUNT(*) AS InvoiceCount, SUM(Amount) AS Total
-    FROM Issuer1.dbo.Invoices WHERE MONTH(InvoiceDate) = MONTH(GETDATE())
+    FROM XXX_Issuer1.dbo.Invoices WHERE MONTH(InvoiceDate) = MONTH(GETDATE())
     UNION ALL
     SELECT 'Issuer2', COUNT(*), SUM(Amount)
-    FROM Issuer2.dbo.Invoices WHERE MONTH(InvoiceDate) = MONTH(GETDATE())
+    FROM XXX_Issuer2.dbo.Invoices WHERE MONTH(InvoiceDate) = MONTH(GETDATE())
     UNION ALL
     SELECT 'Issuer3', COUNT(*), SUM(Amount)
-    FROM Issuer3.dbo.Invoices WHERE MONTH(InvoiceDate) = MONTH(GETDATE())
+    FROM XXX_Issuer3.dbo.Invoices WHERE MONTH(InvoiceDate) = MONTH(GETDATE())
+
+Step 7b → Replace XXX_ → Keshevrav_:
+    SELECT 'Issuer1' AS IssuerName, COUNT(*) AS InvoiceCount, SUM(Amount) AS Total
+    FROM Keshevrav_Issuer1.dbo.Invoices WHERE MONTH(InvoiceDate) = MONTH(GETDATE())
+    UNION ALL
+    SELECT 'Issuer2', COUNT(*), SUM(Amount)
+    FROM Keshevrav_Issuer2.dbo.Invoices WHERE MONTH(InvoiceDate) = MONTH(GETDATE())
+    UNION ALL
+    SELECT 'Issuer3', COUNT(*), SUM(Amount)
+    FROM Keshevrav_Issuer3.dbo.Invoices WHERE MONTH(InvoiceDate) = MONTH(GETDATE())
+
+    (Note: 'Issuer1' string literals are NOT affected — only "XXX_" prefix is replaced)
 
 Step 8 → All databases in allowed list? YES → Pass
 Step 9 → Execute → 3 rows returned
@@ -972,14 +1228,15 @@ Step 10 → Return JSON
 This document covers the complete Vanna AI flow from the moment FastAPI receives the .NET-enriched request to the moment the response is returned.
 
 **Key principles:**
-1. **PRE-HOC security** — restrict what the LLM sees before SQL generation, don't fix SQL after
-2. **5-layer permission enforcement** — 3 layers from .NET, 2 layers from DB
-3. **Entity detection first** — determine what the question is about, then check if the user can access it
-4. **User-specific schema** — each request gets a DDL with only the tables the user can access
-5. **Fully-qualified table names** — enables cross-database JOINs on the same SQL Server instance
-6. **SQL validation as safety net** — 5 checks after generation as a fallback, not the primary defense
-7. **One Vanna instance per customer** — trained once, works for all users with different permission contexts
-8. **Hebrew/English bilingual** — entity mapping in training and system prompt, response in question's language
+1. **ONE shared Vanna per server** — trained once with `XXX_` prefix, shared by all customers on the server. Saves memory, simplifies training updates.
+2. **XXX_ prefix replacement** — Vanna generates SQL with `XXX_` placeholder. Simple `sql.replace("XXX_", f"{DB_PREFIX}_")` converts to actual customer database names. Works for ALL databases (RapidOne, Rapid_Common, Issuer1, Issuer2, etc.)
+3. **PRE-HOC security** — restrict what the LLM sees before SQL generation, don't fix SQL after
+4. **5-layer permission enforcement** — 3 layers from .NET, 2 layers from DB
+5. **Entity detection first** — determine what the question is about, then check if the user can access it
+6. **User-specific schema** — each request gets a DDL with only the tables the user can access
+7. **Fully-qualified table names** — enables cross-database JOINs on the same SQL Server instance
+8. **SQL validation as safety net** — 5 checks after generation as a fallback, not the primary defense
+9. **Hebrew/English bilingual** — entity mapping in training and system prompt, response in question's language
 
 **Related documents:**
 - `AUTH_FLOW.md` — covers everything before this flow (login, token, .NET proxy, X-API-KEY)
